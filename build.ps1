@@ -43,6 +43,7 @@ $argList = @(
     "/resource:$(Join-Path $src 'bg.png'),bg"
     "/resource:$(Join-Path $src 'logo.ico'),ico"
     (Join-Path $src 'launcher.cs')
+    (Join-Path $src 'AssemblyInfo.cs')
 )
 
 Write-Host '编译中...'
@@ -61,6 +62,11 @@ $names = $asm.GetManifestResourceNames()
 foreach ($n in @('ps1', 'ui', 'bg', 'ico')) {
     if ($names -notcontains $n) { throw "缺少内嵌资源：$n" }
 }
+
+# 校验：文件属性里的名称与版本（右键 exe → 属性 → 详细信息）
+$vi = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($outExe)
+if ($vi.FileDescription -ne '大肥鱼 · 强制删除工具') { throw "文件属性里的名称不对：$($vi.FileDescription)" }
+if ($vi.FileVersion -ne '1.1.0.0') { throw "文件属性里的版本不对：$($vi.FileVersion)" }
 
 $fi = Get-Item -LiteralPath $outExe
 Write-Host ("完成：{0}（{1:N0} 字节）" -f $fi.FullName, $fi.Length)

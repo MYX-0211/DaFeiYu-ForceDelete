@@ -9,7 +9,7 @@
 //    4. 已有窗口时再次双击 exe -> 激活原窗口，不重复开
 //    5. -Install / -Uninstall / -SelfTest / -Probe / -Pending 前台执行并呈现结果
 //
-//  编译：build.bat / build.ps1（csc.exe，目标 .NET Framework 4.x，Win10/11 自带）
+//  编译：build.ps1（csc.exe，目标 .NET Framework 4.x，Win10/11 自带）
 // ============================================================================
 using System;
 using System.Collections.Generic;
@@ -211,8 +211,27 @@ namespace DeepSeek
                     }
                     catch { }
                 }
-                File.WriteAllBytes(dst, data);
-                return dst;
+                for (int attempt = 0; attempt < 4; attempt++)
+                {
+                    try
+                    {
+                        File.WriteAllBytes(dst, data);
+                        return dst;
+                    }
+                    catch
+                    {
+                        // 多个进程同时首次启动（资源管理器多选后一次加入多项）会撞车：
+                        // 对方可能正在写同一个文件。等一下再试；对方写完了就直接复用。
+                        try
+                        {
+                            byte[] cur = File.ReadAllBytes(dst);
+                            if (cur.Length == data.Length && Hash(cur) == Hash(data)) { return dst; }
+                        }
+                        catch { }
+                        Thread.Sleep(150);
+                    }
+                }
+                return null;
             }
             catch
             {
@@ -311,11 +330,21 @@ namespace DeepSeek
 
                 using (Process p = Process.Start(psi))
                 {
+                    // 先读完标准输出再读错误输出会死锁：子进程把错误管道写满后会阻塞，
+                    // 而它还要等标准输出这边。错误输出放到另一个线程读。
+                    string errText = "";
+                    Thread errReader = new Thread(delegate()
+                    {
+                        try { errText = p.StandardError.ReadToEnd(); } catch { }
+                    });
+                    errReader.IsBackground = true;
+                    errReader.Start();
+
                     string o = p.StandardOutput.ReadToEnd();
-                    string e = p.StandardError.ReadToEnd();
                     p.WaitForExit();
+                    errReader.Join();
                     code = p.ExitCode;
-                    output = (o + e).Trim();
+                    output = (o + errText).Trim();
                 }
             }
             catch (Exception ex)
@@ -383,13 +412,18 @@ namespace DeepSeek
         {
             try
             {
-                MessageBox.Show(text, AppName, MessageBoxButtons.OK,
+                // 弹给用户看的标题用软件名，不用内部代号
+                MessageBox.Show(text, AppTitle, MessageBoxButtons.OK,
                     error ? MessageBoxIcon.Error : MessageBoxIcon.Information);
             }
             catch { }
         }
 
         // ---------------- 队列（与脚本内 Add-QueuePath 保持一致） ----------------
+
+        // 旧版本的数据目录：WinDel 是更早的名字，CC-DEL 是上游的名字。
+        // 升级换名不该把用户攒了一路的待删列表弄丢。
+        private static readonly string[] LegacyDirs = { "WinDel", "CC-DEL" };
 
         private static void MigrateLegacy()
         {
@@ -398,10 +432,15 @@ namespace DeepSeek
                 if (File.Exists(QueueFile())) { return; }
                 string baseDir = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
                 if (string.IsNullOrEmpty(baseDir)) { return; }
-                string legacy = Path.Combine(baseDir, "WinDel", "queue.txt");
-                if (!File.Exists(legacy)) { return; }
-                Directory.CreateDirectory(DataRoot());
-                File.Copy(legacy, QueueFile(), false);
+                for (int i = 0; i < LegacyDirs.Length; i++)
+                {
+                    string legacy = Path.Combine(baseDir, LegacyDirs[i], "queue.txt");
+                    if (!File.Exists(legacy)) { continue; }
+                    Directory.CreateDirectory(DataRoot());
+                    File.Copy(legacy, QueueFile(), false);
+                    Log("📦 已迁移旧版本的待删列表：" + legacy);
+                    return;
+                }
             }
             catch { }
         }
@@ -512,18 +551,32 @@ namespace DeepSeek
                 Log("⚠️ 路径不存在，已忽略：" + p);
                 return false;
             }
-            List<string> items = ReadQueue();
-            for (int i = 0; i < items.Count; i++)
+            // 资源管理器多选后每一项各起一个进程，「读-改-写」必须串行，
+            // 否则后写的会把先写的覆盖掉，表现为加入 5 个只剩 3 个。
+            bool owned = false;
+            using (Mutex gate = new Mutex(true, @"Local\DeepSeek_QueueLock", out owned))
             {
-                if (string.Equals(items[i], p, StringComparison.OrdinalIgnoreCase))
+                try { gate.WaitOne(5000); } catch { }
+                try
                 {
-                    Log("ℹ️ 已在列表中：" + p);
-                    return false;
+                    List<string> items = ReadQueue();
+                    for (int i = 0; i < items.Count; i++)
+                    {
+                        if (string.Equals(items[i], p, StringComparison.OrdinalIgnoreCase))
+                        {
+                            Log("ℹ️ 已在列表中：" + p);
+                            return false;
+                        }
+                    }
+                    items.Add(p);
+                    WriteQueue(items);
+                }
+                catch (Exception ex) { Log("❌ 写入队列失败：" + ex.Message); return false; }
+                finally
+                {
+                    try { gate.ReleaseMutex(); } catch { }
                 }
             }
-            items.Add(p);
-            try { WriteQueue(items); }
-            catch (Exception ex) { Log("❌ 写入队列失败：" + ex.Message); return false; }
             Log("➕ 加入列表：" + p);
             return true;
         }

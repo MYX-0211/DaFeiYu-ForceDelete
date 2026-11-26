@@ -101,11 +101,16 @@ if (-not (Test-Path -LiteralPath $script:Root)) {
     New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
 }
 
-# 老版本（WinDel）队列迁移：换名不该把用户攒了一路的待删列表弄丢。
+# 老版本（WinDel / 上游 CC-DEL）队列迁移：换名不该把用户攒了一路的待删列表弄丢。
 try {
-    $legacyQueue = Join-Path (Join-Path $env:LOCALAPPDATA 'WinDel') 'queue.txt'
-    if ((Test-Path -LiteralPath $legacyQueue) -and -not (Test-Path -LiteralPath $script:QueueFile)) {
-        Copy-Item -LiteralPath $legacyQueue -Destination $script:QueueFile -Force
+    if (-not (Test-Path -LiteralPath $script:QueueFile)) {
+        foreach ($legacyDir in @('WinDel', 'CC-DEL')) {
+            $legacyQueue = Join-Path (Join-Path $env:LOCALAPPDATA $legacyDir) 'queue.txt'
+            if (Test-Path -LiteralPath $legacyQueue) {
+                Copy-Item -LiteralPath $legacyQueue -Destination $script:QueueFile -Force
+                break
+            }
+        }
     }
 } catch { }
 if (-not (Test-Path -LiteralPath $script:QueueFile)) {
@@ -500,6 +505,18 @@ function Unlock-Target {
 }
 
 # ========================= 属性 / 权限 =========================
+# takeown / icacls / robocopy / cmd / attrib 一律按完整路径调用。
+# 它们都在 System32 里，正常双击启动时 PATH 里一定有；但被精简过 PATH 的环境
+# （便携终端、某些启动器、计划任务）里未必有——那种情况下这两步会静默变成什么都没做。
+function Get-SysTool {
+    param([string]$Name)
+    if ($env:SystemRoot) {
+        $full = Join-Path (Join-Path $env:SystemRoot 'System32') $Name
+        try { if ([System.IO.File]::Exists($full)) { return $full } } catch { }
+    }
+    return $Name   # 找不到就退回裸文件名，交给 PATH
+}
+
 function Clear-Attribute {
     param([string]$Path)
     # 保留名文件不能交给 attrib.exe：它拿到的参数会被解析成设备，等于什么都没做
@@ -514,9 +531,9 @@ function Clear-Attribute {
     Write-Log '🔧 清除只读/隐藏/系统属性'
     try {
         if (Test-IsDirectory -Path $Path) {
-            & attrib.exe -R -H -S /S /D "$usePath" *> $null
+            & (Get-SysTool 'attrib.exe') -R -H -S /S /D "$usePath" *> $null
         } else {
-            & attrib.exe -R -H -S "$usePath" *> $null
+            & (Get-SysTool 'attrib.exe') -R -H -S "$usePath" *> $null
             try { [System.IO.File]::SetAttributes((ConvertTo-ExtendedPath -Path $Path), [System.IO.FileAttributes]::Normal) } catch { }
         }
     } catch { }
@@ -528,14 +545,14 @@ function Repair-Acl {
     $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
     if (Test-IsDirectory -Path $Path) {
         Write-Log '🔧 接管所有权（递归）'
-        & takeown.exe /F "$ext" /R /D Y *> $null
+        & (Get-SysTool 'takeown.exe') /F "$ext" /R /D Y *> $null
         Write-Log ('🔧 授予完全控制：' + $me)
-        & icacls.exe "$ext" /grant "$($me):(OI)(CI)F" /T /C /Q *> $null
+        & (Get-SysTool 'icacls.exe') "$ext" /grant "$($me):(OI)(CI)F" /T /C /Q *> $null
     } else {
         Write-Log '🔧 接管所有权'
-        & takeown.exe /F "$ext" *> $null
+        & (Get-SysTool 'takeown.exe') /F "$ext" *> $null
         Write-Log ('🔧 授予完全控制：' + $me)
-        & icacls.exe "$ext" /grant "$($me):F" /C /Q *> $null
+        & (Get-SysTool 'icacls.exe') "$ext" /grant "$($me):F" /C /Q *> $null
     }
 }
 
@@ -555,9 +572,9 @@ function Remove-Target {
                 $empty = Join-Path $env:TEMP ('wdel_' + [Guid]::NewGuid().ToString('N'))
                 New-Item -ItemType Directory -Path $empty -Force | Out-Null
                 try {
-                    & robocopy.exe "$empty" "$Path" /MIR /R:0 /W:0 /NFL /NDL /NJH /NJS /NP *> $null
+                    & (Get-SysTool 'robocopy.exe') "$empty" "$Path" /MIR /R:0 /W:0 /NFL /NDL /NJH /NJS /NP *> $null
                     try { [System.IO.Directory]::Delete($ext, $true) } catch {
-                        try { [System.IO.Directory]::Delete($ext, $false) } catch { & cmd.exe /c rd /s /q "$ext" *> $null }
+                        try { [System.IO.Directory]::Delete($ext, $false) } catch { & (Get-SysTool 'cmd.exe') /c rd /s /q "$ext" *> $null }
                     }
                 } finally {
                     Remove-Item -LiteralPath $empty -Recurse -Force -ErrorAction SilentlyContinue
@@ -568,7 +585,7 @@ function Remove-Target {
                 try { [System.IO.File]::SetAttributes($ext, [System.IO.FileAttributes]::Normal) } catch { }
                 [System.IO.File]::Delete($ext)
             } else {
-                & cmd.exe /c del /f /q /a "$ext" *> $null
+                & (Get-SysTool 'cmd.exe') /c del /f /q /a "$ext" *> $null
             }
         }
     } catch {
@@ -755,11 +772,15 @@ function Get-MenuIcon {
     return ''
 }
 
-# 旧版本（WinDel）留下的菜单项要顺手清掉，否则右键里会出现两条同名命令。
+# 旧版本留下的菜单项要顺手清掉，否则右键里会出现两条同名命令：
+#   WinDelAdd  = 更早的 WinDel
+#   CCDELAdd   = 上游 CC-DEL，以及本工具改名之前的版本
 function Remove-LegacyMenu {
     $parents = @('Software\Classes\*\shell', 'Software\Classes\Directory\shell', 'Software\Classes\Directory\Background\shell')
     foreach ($p in $parents) {
-        try { [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree(($p + '\WinDelAdd'), $false) } catch { }
+        foreach ($legacy in @('WinDelAdd', 'CCDELAdd')) {
+            try { [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree(($p + '\' + $legacy), $false) } catch { }
+        }
     }
 }
 
@@ -807,6 +828,33 @@ function Test-MenuInstalled {
         if ($k) { $k.Close(); return $true }
         return $false
     } catch { return $false }
+}
+
+# 菜单自愈：右键菜单里记的是「安装那一刻」的程序路径。exe 之后被移动、改名或删除，
+# 菜单就指向一个不存在的文件，点了没反应——而习惯用右键菜单的人不会直接开 exe，也就永远修不回来。
+# 所以启动时检查一次：目标程序已经不在了，才改成当前程序。
+# 目标还在就不动：用户可能同时留着好几个副本，不能运行哪个就把菜单改指哪个。
+function Repair-MenuPath {
+    if (-not $script:HostExe) { return }
+    try {
+        $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\Classes\*\shell\DeepSeekAdd\command')
+        if (-not $k) { return }
+        $cmd = [string]$k.GetValue('')
+        $k.Close()
+        if (-not $cmd) { return }
+        # 菜单命令的第一段就是被调用的程序（安装时带引号）
+        $target = ''
+        if ($cmd.StartsWith('"')) {
+            $end = $cmd.IndexOf('"', 1)
+            if ($end -gt 1) { $target = $cmd.Substring(1, $end - 1) }
+        } else {
+            $sp = $cmd.IndexOf(' ')
+            if ($sp -gt 0) { $target = $cmd.Substring(0, $sp) } else { $target = $cmd }
+        }
+        if ($target -and (Test-Path -LiteralPath $target)) { return }
+        $null = Install-Menu
+        Write-Log ('🔧 右键菜单原来指向的程序已不存在，已改为当前程序：' + $script:HostExe)
+    } catch { }
 }
 
 # ========================= 任务栏身份（AppUserModelID） =========================
@@ -877,7 +925,7 @@ function Show-MainWindow {
     if (-not $uiPath) {
         [System.Windows.Forms.MessageBox]::Show(
             "缺少界面资源 DeepSeek.Ui.cs。`r`n请用编译好的 大肥鱼-强制删除工具.exe 启动，或把该文件放到脚本同目录。",
-            'DeepSeek', 'OK', 'Error') | Out-Null
+            '大肥鱼 · 强制删除工具', 'OK', 'Error') | Out-Null
         return
     }
     if (-not ('DeepSeek.SceneForm' -as [type])) {
@@ -1279,7 +1327,8 @@ function Show-MainWindow {
     $script:Form.Add_DragDrop($dropHandler)
 
     # ================= 事件 =================
-    $script:BtnRemove.Add_Click({
+    # 「移除选中」按钮与 Delete 键共用：只把项从列表里拿掉，不碰磁盘上的文件
+    function Remove-SelectedItems {
         if ($script:Busy) { return }
         $picked = @(Get-SelectedItems)
         if ($picked.Count -eq 0) { Write-Log 'ℹ️ 未选中任何项'; return }
@@ -1292,6 +1341,15 @@ function Show-MainWindow {
         Set-QueueItems -Items $remain
         Refresh-List
         foreach ($p in $picked) { Write-Log ('➖ 移除：' + $p) }
+    }
+    $script:BtnRemove.Add_Click({ Remove-SelectedItems })
+
+    $script:ListBox.Add_KeyDown({
+        param($sender, $e)
+        if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Delete) {
+            $e.Handled = $true
+            Remove-SelectedItems
+        }
     })
 
     $script:BtnClear.Add_Click({
@@ -1301,7 +1359,11 @@ function Show-MainWindow {
         Write-Log '🗑️ 列表已清空'
     })
 
-    $script:BtnLog.Add_Click({ Start-Process explorer.exe -ArgumentList ('/select,"' + $script:LogFile + '"') })
+    $script:BtnLog.Add_Click({
+        # 同样不依赖 PATH 找 explorer
+        $exp = if ($env:WINDIR) { Join-Path $env:WINDIR 'explorer.exe' } else { 'explorer.exe' }
+        Start-Process -FilePath $exp -ArgumentList ('/select,"' + $script:LogFile + '"')
+    })
 
     # 仅解除占用：不删除、不改权限、不改属性
     $script:BtnUnlock.Add_Click({
@@ -1354,13 +1416,21 @@ function Show-MainWindow {
         Write-Log ('══════ ' + $msg + ' ══════')
     })
 
+    # 安装/卸载都要给出明确反馈：界面模式下 Write-Host 的输出是看不到的
     $script:BtnMenu.Add_Click({
+        if ($script:Busy) { return }
         if (Test-MenuInstalled) {
             if ([System.Windows.Forms.MessageBox]::Show('右键菜单已存在，是否移除？', '右键菜单', 'YesNo', 'Question') -eq 'Yes') {
-                Uninstall-Menu
+                Uninstall-Menu | Out-Null
+                Write-Log '🗑️ 右键菜单已移除'
+                [System.Windows.Forms.MessageBox]::Show('右键菜单已移除。', '右键菜单', 'OK', 'Information') | Out-Null
             }
+        } elseif (Install-Menu) {
+            Write-Log '✅ 右键菜单已安装'
+            [System.Windows.Forms.MessageBox]::Show("已安装。`r`n`r`n重新打开一个文件夹窗口，在文件或文件夹上点右键，`r`n选「添加到强制删除列表」，它就会出现在这里。", '右键菜单', 'OK', 'Information') | Out-Null
         } else {
-            Install-Menu
+            Write-Log '❌ 右键菜单安装失败：有注册表项写不进去'
+            [System.Windows.Forms.MessageBox]::Show('安装失败：有注册表项写不进去，请查看日志。', '右键菜单', 'OK', 'Warning') | Out-Null
         }
     })
 
@@ -1460,10 +1530,13 @@ function Show-MainWindow {
         Refresh-List
         $script:Timer.Start()
         Write-Log ('🪟 界面就绪，句柄=' + $script:Form.Handle + ' 尺寸=' + $script:Form.Width + 'x' + $script:Form.Height)
-        if (Test-MenuInstalled) { Write-Log 'ℹ️ 右键菜单已安装' } else { Write-Log 'ℹ️ 未安装右键菜单，可点右上角「右键菜单」安装' }
+        if (Test-MenuInstalled) {
+            Repair-MenuPath
+            Write-Log 'ℹ️ 右键菜单已安装'
+        } else { Write-Log 'ℹ️ 未安装右键菜单，可点右上角「右键菜单」安装' }
         $items = @(Get-QueueItems)
         if ($items.Count -gt 0) { Write-Log ('ℹ️ 当前队列 ' + $items.Count + ' 项，待处理') }
-        else { Write-Log 'ℹ️ 提示：可把文件直接拖进列表' }
+        else { Write-Log 'ℹ️ 提示：可把文件直接拖进列表，按 Delete 可移除选中项' }
     })
 
     [void]$script:Form.ShowDialog()
@@ -1486,7 +1559,7 @@ function Invoke-SelfTest {
     $script:t_pass = 0
     $script:t_fail = 0
 
-    Write-Host '== DeepSeek 自检 ==' -ForegroundColor Cyan
+    Write-Host '== 大肥鱼 · 强制删除工具 自检 ==' -ForegroundColor Cyan
 
     # 1 长路径转换
     Check '扩展路径-本地盘' ((ConvertTo-ExtendedPath -Path 'C:\Temp\a.txt') -eq '\\?\C:\Temp\a.txt')
