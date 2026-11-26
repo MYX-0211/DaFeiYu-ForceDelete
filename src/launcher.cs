@@ -45,6 +45,42 @@ namespace DeepSeek
         [DllImport("user32.dll")]
         private static extern bool IsIconic(IntPtr hWnd);
 
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GetStdHandle(int nStdHandle);
+
+        [DllImport("kernel32.dll")]
+        private static extern bool SetConsoleOutputCP(uint codePage);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool WriteFile(IntPtr hFile, byte[] buffer, uint numberOfBytesToWrite, out uint numberOfBytesWritten, IntPtr lpOverlapped);
+
+        // 有没有可用的标准输出。双击运行时没有（返回空句柄）；从终端、脚本、
+        // 构建流程里调用时有。用来决定命令行模式的结果是写出去还是弹框。
+        private static bool HasStdOut()
+        {
+            try
+            {
+                IntPtr h = GetStdHandle(-11);   // STD_OUTPUT_HANDLE
+                if (h == IntPtr.Zero || h == new IntPtr(-1)) { return false; }
+                return true;
+            }
+            catch { return false; }
+        }
+
+        // 把文本按 UTF-8 直接写到标准输出句柄。不经过 Console：重定向到文件时并没有控制台，
+        // 而 Console 的编码设置恰恰依赖控制台。写不出去返回 false，由调用方改弹框。
+        private static bool TryWriteStdOut(string text)
+        {
+            IntPtr h;
+            try { h = GetStdHandle(-11); } catch { return false; }
+            if (h == IntPtr.Zero || h == new IntPtr(-1)) { return false; }
+            try { SetConsoleOutputCP(65001); } catch { }   // 真有控制台时让它按 UTF-8 显示中文；没有控制台时失败无所谓
+            byte[] buf = Encoding.UTF8.GetBytes(text);
+            uint done;
+            bool ok = WriteFile(h, buf, (uint)buf.Length, out done, IntPtr.Zero);
+            return ok && done == (uint)buf.Length;
+        }
+
         // ---------------- 入口 ----------------
 
         [STAThread]
@@ -353,23 +389,28 @@ namespace DeepSeek
                 return 1;
             }
 
-            if (output.Length > 0)
+            if (output.Length == 0) { return code; }
+
+            string saveAs = Path.Combine(DataRoot(), "last-output.txt");
+            try
             {
-                string saveAs = Path.Combine(DataRoot(), "last-output.txt");
-                try
-                {
-                    Directory.CreateDirectory(DataRoot());
-                    File.WriteAllText(saveAs, output, Encoding.UTF8);
-                }
-                catch { }
-                string shown = output;
-                if (shown.Length > 1200)
-                {
-                    shown = "……（输出过长，已截断，完整内容见）……\r\n" + shown.Substring(shown.Length - 1200);
-                }
-                shown += "\r\n\r\n完整输出：" + saveAs;
-                MsgBox(shown, false);
+                Directory.CreateDirectory(DataRoot());
+                File.WriteAllText(saveAs, output, Encoding.UTF8);
             }
+            catch { }
+
+            // 有标准输出（从终端、脚本、构建流程里调用）：原样写出去就返回，不弹窗。
+            // 以前不管有没有控制台都弹系统对话框等用户点确定，脚本里调用会一直挂着。
+            if (HasStdOut() && TryWriteStdOut(output + Environment.NewLine)) { return code; }
+
+            // 双击运行、没有控制台：才用对话框呈现
+            string shown = output;
+            if (shown.Length > 1200)
+            {
+                shown = "……（输出过长，已截断，完整内容见）……\r\n" + shown.Substring(shown.Length - 1200);
+            }
+            shown += "\r\n\r\n完整输出：" + saveAs;
+            MsgBox(shown, false);
             return code;
         }
 

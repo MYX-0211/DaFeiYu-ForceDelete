@@ -29,6 +29,35 @@ if ($head.Length -lt 3 -or $head[0] -ne 0xEF -or $head[1] -ne 0xBB -or $head[2] 
     throw 'DeepSeek.ps1 缺少 UTF-8 BOM，直接运行脚本时中文会乱码，请先修正编码'
 }
 
+# 这两份源码是当资源塞进 exe 的，csc 不会检查它们。有错也照样能编出 exe，
+# 要到用户双击时才炸 —— v1.0.0 / v1.1.0 就是这样带着一句 `$ok = false` 发出去的。
+# 所以在这里先各自过一遍。
+
+# 1) 主脚本：不能有语法错误，也不能把 true / false / null 写成命令
+$tokens = $null; $perr = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($ps1, [ref]$tokens, [ref]$perr)
+if (@($perr).Count -gt 0) {
+    foreach ($e in @($perr)) { Write-Host ('  第 {0} 行：{1}' -f $e.Extent.StartLineNumber, $e.Message) }
+    throw 'DeepSeek.ps1 有语法错误'
+}
+$bare = 0
+foreach ($c in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)) {
+    $cn = $c.GetCommandName()
+    if ($cn -eq 'true' -or $cn -eq 'false' -or $cn -eq 'null') {
+        $bare++
+        Write-Host ('  第 {0} 行：{1}' -f $c.Extent.StartLineNumber, $c.Extent.Text)
+    }
+}
+if ($bare -gt 0) { throw "DeepSeek.ps1 把 true/false/null 写成了命令（共 $bare 处），运行时会抛异常" }
+
+# 2) 界面源码：先单独编译一次，编不过就停
+$ui = Join-Path $src 'DeepSeek.Ui.cs'
+$tmpDll = Join-Path $env:TEMP ('dfy-ui-check_' + [Guid]::NewGuid().ToString('N') + '.dll')
+& $csc /nologo /target:library "/out:$tmpDll" /r:System.Windows.Forms.dll /r:System.Drawing.dll $ui
+$uiRc = $LASTEXITCODE
+Remove-Item -LiteralPath $tmpDll -Force -ErrorAction SilentlyContinue
+if ($uiRc -ne 0) { throw 'DeepSeek.Ui.cs 编译失败' }
+
 $argList = @(
     '/nologo'
     '/target:winexe'
@@ -66,7 +95,7 @@ foreach ($n in @('ps1', 'ui', 'bg', 'ico')) {
 # 校验：文件属性里的名称与版本（右键 exe → 属性 → 详细信息）
 $vi = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($outExe)
 if ($vi.FileDescription -ne '大肥鱼 · 强制删除工具') { throw "文件属性里的名称不对：$($vi.FileDescription)" }
-if ($vi.FileVersion -ne '1.1.0.0') { throw "文件属性里的版本不对：$($vi.FileVersion)" }
+if ($vi.FileVersion -ne '1.1.1.0') { throw "文件属性里的版本不对：$($vi.FileVersion)" }
 
 $fi = Get-Item -LiteralPath $outExe
 Write-Host ("完成：{0}（{1:N0} 字节）" -f $fi.FullName, $fi.Length)

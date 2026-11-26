@@ -139,6 +139,56 @@ function Write-Log {
     if ($script:EchoLog) { Write-Host $line }
 }
 
+# ========================= 提示框 =========================
+# 界面里的所有提示统一从这里出：界面模式下是毛玻璃提示框，命令行模式退回系统对话框。
+# Kind ：0 信息 / 1 成功 / 2 警告 / 3 错误 / 4 询问
+# Kinds：与 Buttons 一一对应，取值同 GlassButton —— 0 中性 / 1 红色实心 / 2 红框 / 3 幽灵
+# 返回被点中的按钮序号。没点按钮就关掉（Esc、Alt+F4）时返回 $Cancel，没给 $Cancel 则返回 -1。
+function Show-Msg {
+    # 只接受具名参数：参数一旦写错位置会直接报绑定错误并被接住，而不是悄悄错位传给别的参数
+    [CmdletBinding()]
+    param(
+        [string]$Title   = '提示',
+        [string]$Text    = '',
+        [string[]]$Buttons = @('确定'),
+        [int[]]$Kinds    = @(),
+        [int]$Kind       = 0,
+        [int]$Default    = 0,
+        [int]$Cancel     = -1
+    )
+    $cap = @($Buttons)
+    if ($cap.Count -eq 0) { $cap = @('确定') }
+    $k = @($Kinds)
+    if ($k.Count -ne $cap.Count) { $k = @(0) * $cap.Count }
+
+    if ($script:GuiMode -and ('DeepSeek.GlassDialog' -as [type]) -and $script:Form -and $script:Form.IsHandleCreated) {
+        return [int][DeepSeek.GlassDialog]::Show($script:Form, [DeepSeek.MsgKind]([int]$Kind), $Title, $Text,
+            [string[]]$cap, [int[]]$k, [int]$Default, [int]$Cancel)
+    }
+
+    # 命令行模式，或界面还没建好：系统对话框
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        $icon = 'Information'
+        if ($Kind -eq 2) { $icon = 'Warning' }
+        if ($Kind -eq 3) { $icon = 'Error' }
+        if ($Kind -eq 4) { $icon = 'Question' }
+        $mb = 'OK'
+        if ($cap.Count -eq 2) { $mb = 'YesNo' }
+        if ($cap.Count -ge 3) { $mb = 'YesNoCancel' }
+        $dr = [System.Windows.Forms.MessageBox]::Show($Text, $Title, $mb, $icon)
+        if ($dr -eq 'Yes') { return 0 }
+        if ($dr -eq 'No') { return 1 }
+        if ($dr -eq 'Cancel') { return 2 }
+        return 0
+    } catch {
+        # 连系统对话框都弹不出来（例如没有桌面会话）：写进日志，并按「没同意」处理
+        Write-Log ('💬 ' + $Title + '：' + ($Text -replace "`r`n", ' '))
+        if ($Cancel -ge 0) { return $Cancel }
+        return -1
+    }
+}
+
 # ========================= 队列文件（列表的唯一数据源） =========================
 function Get-QueueItems {
     if (-not (Test-Path -LiteralPath $script:QueueFile)) { return @() }
@@ -481,10 +531,12 @@ function Unlock-Target {
     if ($script:KillAll) {
         $doKill = $true
     } elseif ($script:GuiMode -and $script:AskKill) {
-        $msg = "以下进程正在占用：`r`n`r`n$names`r`n`r`n结束进程可能造成未保存数据丢失。是否结束它们？"
-        $r = [System.Windows.Forms.MessageBox]::Show($msg, '解除占用', 'YesNoCancel', 'Warning')
-        if ($r -eq 'Cancel') { Write-Log '⏹️ 已中止该项'; return 'abort' }
-        if ($r -eq 'Yes') { $doKill = $true }
+        $msg = "以下进程正在占用：`r`n`r`n$names`r`n`r`n结束进程可能造成未保存的数据丢失。要结束它们吗？" +
+               "`r`n" + '选「跳过」则这一项先不处理，仍保留在列表里。'
+        # 0 结束进程 / 1 跳过 / 2 停止本次处理。回车默认是「跳过」：结束进程不可逆，不该被一次回车带过去
+        $r = Show-Msg -Title '解除占用' -Kind 4 -Text $msg -Buttons '结束进程','跳过','停止本次处理' -Kinds 1,0,0 -Default 1 -Cancel 2
+        if ($r -eq 2) { Write-Log '⏹️ 已中止该项'; return 'abort' }
+        if ($r -eq 0) { $doKill = $true }
     }
 
     if (-not $doKill) {
@@ -727,12 +779,12 @@ function Invoke-ForceDelete {
         if ($script:RebootAll) {
             $doIt = $true
         } elseif ($script:GuiMode) {
-            $msg = '该目标被已加载的模块锁住，本次开机期间无法释放。' + "`r`n`r`n" +
-                   '要登记为「重启后自动删除」吗？' + "`r`n" +
-                   '系统会在下次开机时清除它，不需要你再手动操作。'
-            $r = [System.Windows.Forms.MessageBox]::Show($msg, '需要重启才能删除', 'YesNoCancel', 'Question')
-            if ($r -eq 'Cancel') { Write-Log '⏹️ 已取消登记'; return $false }
-            if ($r -eq 'Yes') { $doIt = $true; $script:RebootAll = $true }
+            $msg = '这一项用常规手段没能删掉，多半是被已加载的模块锁住，本次开机期间释放不了。' + "`r`n`r`n" +
+                   "`r`n" + '要登记为「重启后自动删除」吗？下次开机会自动清除，不需要再手动处理。'
+            # 0 登记 / 1 不登记 / 2 停止本次处理。回车默认是「不用了」
+            $r = Show-Msg -Title '需要重启才能删除' -Kind 4 -Text $msg -Buttons '重启后删除','不用了','停止本次处理' -Kinds 1,0,0 -Default 1 -Cancel 2
+            if ($r -eq 2) { Write-Log '⏹️ 已取消登记'; return $false }
+            if ($r -eq 0) { $doIt = $true; $script:RebootAll = $true }
         }
         if ($doIt -and (Add-PendingDelete -Path $target)) {
             Write-Log '   ✅ 已受理：重启后该目标会被自动清除'
@@ -740,6 +792,45 @@ function Invoke-ForceDelete {
         }
     }
     return $false
+}
+
+# ========================= 批量删除（界面按钮与自检共用） =========================
+# 「开始执行删除」和自检调用的都是这一个函数：按钮那条路出问题时，自检能发现。
+# OnProgress($序号, $总数, $路径) 在处理每一项之前调用；OnItemDone($路径, $是否成功, $序号) 在之后调用。
+# 删成功一项就从队列文件里去掉一项；没删掉的留在列表里，由用户决定重试还是移出。
+function Invoke-QueueDelete {
+    param(
+        [string[]]$Items,
+        [scriptblock]$OnProgress,
+        [scriptblock]$OnItemDone
+    )
+    $list = @($Items)
+    $total = $list.Count
+    $okList = @()
+    $failList = @()
+    $n = 0
+    foreach ($it in $list) {
+        $n++
+        $path = [string]$it
+        if ($OnProgress) { & $OnProgress $n $total $path }
+        Write-Log ('—————————— ' + $path + ' ——————————')
+        # 引擎只应返回一个布尔值。万一内部有命令多吐了输出，只认最后一个布尔值，避免把数组当成「成功」
+        $ok = $false
+        try {
+            $out = @(Invoke-ForceDelete -Path $path)
+            if ($out.Count -gt 0) { $ok = ($out[-1] -is [bool]) -and ($out[-1]) }
+        } catch {
+            Write-Log ('❌ 处理这一项时出错：' + $_.Exception.Message)
+        }
+        if ($ok) {
+            $okList += $path
+        } else {
+            $failList += $path
+            Write-Log '⏸️ 这一项没有删掉，仍保留在列表里：可以稍后重试，或选中后按 Delete 移出列表'
+        }
+        if ($OnItemDone) { & $OnItemDone $path $ok $n }
+    }
+    return @{ Ok = $okList; Failed = $failList; Total = $total }
 }
 
 # ========================= 右键菜单注册（HKCU，免管理员） =========================
@@ -945,6 +1036,26 @@ function Show-MainWindow {
 
     $script:GuiMode = $true
     $script:HotIndex = -1
+
+    # 兜底：万一有异常从按钮事件里冲出去，不再弹 WinForms 的异常框，也不让界面卡死。
+    # 写日志、给出提示、把按钮恢复成可用。按钮事件本身都走 Invoke-Guarded，这里只是最后一道。
+    try {
+        [System.Windows.Forms.Application]::SetUnhandledExceptionMode([System.Windows.Forms.UnhandledExceptionMode]::CatchException)
+    } catch { }
+    [System.Windows.Forms.Application]::add_ThreadException({
+        param($s, $e)
+        try {
+            $ex = $e.Exception
+            if (-not $ex) { return }
+            Write-Log ('❌ 未处理的异常：' + $ex.Message)
+            $script:KillAll = $false
+            $script:Busy = $false
+            Set-UiEnabled $true
+            Write-Log '   界面已恢复，可以直接继续操作。'
+            $r = Show-Msg -Title '出错了' -Kind 3 -Text ($ex.Message + "`r`n`r`n界面已恢复，可以直接继续操作。") -Buttons '知道了','打开日志' -Kinds 0,3 -Default 0 -Cancel 0
+            if ($r -eq 1) { Open-LogFile }
+        } catch { }
+    })
 
     # ================= 尺寸（逻辑像素 → 物理） =================
     function Px([int]$v) { [int][DeepSeek.DpiHelper]::S($v) }
@@ -1307,6 +1418,7 @@ function Show-MainWindow {
     # ================= 拖拽加入 =================
     $dropHandler = {
         param($sender, $e)
+        if ($script:Busy) { return }   # 处理过程中不改列表
         try {
             $files = $e.Data.GetData([System.Windows.Forms.DataFormats]::FileDrop)
             foreach ($f in $files) { $null = Add-QueuePath -Path ([string]$f) }
@@ -1327,11 +1439,43 @@ function Show-MainWindow {
     $script:Form.Add_DragDrop($dropHandler)
 
     # ================= 事件 =================
+    # 在资源管理器里定位日志文件（不依赖 PATH 找 explorer）
+    function Open-LogFile {
+        $exp = if ($env:WINDIR) { Join-Path $env:WINDIR 'explorer.exe' } else { 'explorer.exe' }
+        Start-Process -FilePath $exp -ArgumentList ('/select,"' + $script:LogFile + '"')
+    }
+
+    # 所有按钮统一从这里执行。不管里面出什么错，都写日志、给出看得懂的提示，
+    # 并且一定把界面恢复成可用状态 —— 之前的版本一旦出错，界面就永久卡在「处理中」。
+    function Invoke-Guarded([scriptblock]$Body) {
+        if ($script:Busy) { return }
+        try {
+            & $Body
+        } catch {
+            $msg = $_.Exception.Message
+            Write-Log ('❌ 出错：' + $msg)
+            $inv = $_.InvocationInfo
+            if ($inv -and $inv.PositionMessage) { Write-Log ('   位置：' + (($inv.PositionMessage -replace '\s+', ' ').Trim())) }
+            Write-Log '   界面已恢复，可以直接继续操作。'
+            try {
+                $r = Show-Msg -Title '出错了' -Kind 3 -Text ($msg + "`r`n`r`n界面已恢复，可以直接继续操作。") -Buttons '知道了','打开日志' -Kinds 0,3 -Default 0 -Cancel 0
+                if ($r -eq 1) { Open-LogFile }
+            } catch { }
+        } finally {
+            $script:KillAll = $false
+            $script:Busy = $false
+            try { Set-UiEnabled $true } catch { }
+        }
+    }
+
     # 「移除选中」按钮与 Delete 键共用：只把项从列表里拿掉，不碰磁盘上的文件
     function Remove-SelectedItems {
         if ($script:Busy) { return }
         $picked = @(Get-SelectedItems)
-        if ($picked.Count -eq 0) { Write-Log 'ℹ️ 未选中任何项'; return }
+        if ($picked.Count -eq 0) {
+            [void](Show-Msg -Title '移除选中项' -Kind 0 -Text ('还没有选中任何一项。' + "`r`n" + '先在列表里点一下要移除的那一行，再点「移除选中」或按 Delete。'))
+            return
+        }
         $remain = @()
         foreach ($i in @(Get-QueueItems)) {
             $hit = $false
@@ -1340,181 +1484,214 @@ function Show-MainWindow {
         }
         Set-QueueItems -Items $remain
         Refresh-List
-        foreach ($p in $picked) { Write-Log ('➖ 移除：' + $p) }
+        foreach ($p in $picked) { Write-Log ('➖ 移除（不删文件）：' + $p) }
     }
-    $script:BtnRemove.Add_Click({ Remove-SelectedItems })
+    $script:BtnRemove.Add_Click({ Invoke-Guarded { Remove-SelectedItems } })
 
     $script:ListBox.Add_KeyDown({
         param($sender, $e)
         if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Delete) {
             $e.Handled = $true
-            Remove-SelectedItems
+            Invoke-Guarded { Remove-SelectedItems }
         }
     })
 
     $script:BtnClear.Add_Click({
-        if ($script:Busy) { return }
-        Set-QueueItems -Items @()
-        Refresh-List
-        Write-Log '🗑️ 列表已清空'
+        Invoke-Guarded {
+            $items = @(Get-QueueItems)
+            if ($items.Count -eq 0) { return }
+            $r = Show-Msg -Title '清空列表' -Kind 4 -Text ('要把列表里的 ' + $items.Count + " 项全部移出吗？`r`n`r`n只清空列表，不会删除任何文件。") -Buttons '清空','取消' -Kinds 2,0 -Default 1 -Cancel 1
+            if ($r -ne 0) { return }
+            Set-QueueItems -Items @()
+            Refresh-List
+            Write-Log '🗑️ 列表已清空（没有删除任何文件）'
+        }
     })
 
-    $script:BtnLog.Add_Click({
-        # 同样不依赖 PATH 找 explorer
-        $exp = if ($env:WINDIR) { Join-Path $env:WINDIR 'explorer.exe' } else { 'explorer.exe' }
-        Start-Process -FilePath $exp -ArgumentList ('/select,"' + $script:LogFile + '"')
-    })
+    $script:BtnLog.Add_Click({ Invoke-Guarded { Open-LogFile } })
 
     # 仅解除占用：不删除、不改权限、不改属性
     $script:BtnUnlock.Add_Click({
-        if ($script:Busy) { return }
-        $picked = @(Get-SelectedItems)
-        if ($picked.Count -eq 0) {
-            [System.Windows.Forms.MessageBox]::Show('请先在列表中选中要解除占用的项（可按住 Ctrl 多选）。', '解除占用', 'OK', 'Information') | Out-Null
-            return
-        }
-
-        $script:Busy = $true
-        Set-UiEnabled $false
-        Write-Log ('══════ 仅解除占用：' + $picked.Count + ' 项（不会删除任何文件）══════')
-
-        $auto = $false
-        $killed = 0
-        $clean = 0
-        $failed = 0
-        $modLocked = 0
-        $aborted = $false
-        $n = 0
-
-        foreach ($it in $picked) {
-            $n++
-            $script:Status.Text = '解除占用 ' + $n + '/' + $picked.Count + '：' + $it
-            Write-Log ('—————————— ' + $it + ' ——————————')
-            if (-not (Test-Exists -Path $it)) {
-                Write-Log 'ℹ️ 目标已不存在，跳过'
-                $failed++
-                continue
+        Invoke-Guarded {
+            $picked = @(Get-SelectedItems)
+            if ($picked.Count -eq 0) {
+                [void](Show-Msg -Title '解除占用' -Kind 0 -Text '请先在列表中选中要解除占用的项（可按住 Ctrl 多选）。')
+                return
             }
-            $script:KillAll = $auto
-            $st = Unlock-Target -Path $it
-            if ($st -eq 'killed') { $killed++; $auto = $true }
-            elseif ($st -eq 'none') { $clean++ }
-            elseif ($st -eq 'module') { $modLocked++ }
-            elseif ($st -eq 'blocked') { $failed++ }
-            elseif ($st -eq 'abort') { $aborted = $true; break }
-            [System.Windows.Forms.Application]::DoEvents()
-        }
 
-        $script:KillAll = $false
-        $script:Busy = $false
-        Set-UiEnabled $true
-        $msg = '解除占用完成：结束进程 ' + $killed + ' 项，本来无占用 ' + $clean + ' 项'
-        if ($modLocked -gt 0) { $msg += '，被已加载模块锁定 ' + $modLocked + ' 项（需重启才能释放）' }
-        $msg += '，未处理 ' + $failed + ' 项'
-        if ($aborted) { $msg += '（中途停止）' }
-        $script:Status.Text = $msg
-        Write-Log ('══════ ' + $msg + ' ══════')
+            $script:Busy = $true
+            Set-UiEnabled $false
+            Write-Log ('══════ 仅解除占用：' + $picked.Count + ' 项（不会删除任何文件）══════')
+
+            $auto = $false
+            $killed = 0
+            $clean = 0
+            $failed = 0
+            $modLocked = 0
+            $aborted = $false
+            $n = 0
+
+            foreach ($it in $picked) {
+                $n++
+                $script:Status.Text = '解除占用 ' + $n + '/' + $picked.Count + '：' + $it
+                Write-Log ('—————————— ' + $it + ' ——————————')
+                if (-not (Test-Exists -Path $it)) {
+                    Write-Log 'ℹ️ 目标已不存在，跳过'
+                    $failed++
+                    continue
+                }
+                $script:KillAll = $auto
+                $st = Unlock-Target -Path $it
+                if ($st -eq 'killed') { $killed++; $auto = $true }
+                elseif ($st -eq 'none') { $clean++ }
+                elseif ($st -eq 'module') { $modLocked++ }
+                elseif ($st -eq 'blocked') { $failed++ }
+                elseif ($st -eq 'abort') { $aborted = $true; break }
+                [System.Windows.Forms.Application]::DoEvents()
+            }
+            $script:KillAll = $false
+
+            $msg = '解除占用完成：结束进程 ' + $killed + ' 项，本来无占用 ' + $clean + ' 项'
+            if ($modLocked -gt 0) { $msg += '，被已加载模块锁定 ' + $modLocked + ' 项（需重启才能释放）' }
+            $msg += '，未处理 ' + $failed + ' 项'
+            if ($aborted) { $msg += '（中途停止）' }
+            $script:Status.Text = $msg
+            Write-Log ('══════ ' + $msg + ' ══════')
+            $script:Busy = $false
+            Set-UiEnabled $true
+
+            # 一切顺利时只更新状态栏；有需要用户知道的情况才弹提示
+            if ($aborted -or ($modLocked -gt 0) -or ($failed -gt 0)) {
+                $kind = 2
+                $tip = $msg + "`r`n`r`n被模块锁定的项可以点「开始执行删除」，登记为重启后自动清除。"
+                if ($aborted) { $tip = $msg + "`r`n`r`n没有做任何改动，列表保持原样。" }
+                [void](Show-Msg -Title '解除占用' -Kind $kind -Text $tip)
+            } elseif ($killed -gt 0) {
+                [void](Show-Msg -Title '解除占用' -Kind 1 -Text ($msg + "`r`n`r`n" + '现在可以点「开始执行删除」把对应的项删掉。'))
+            }
+        }
     })
 
     # 安装/卸载都要给出明确反馈：界面模式下 Write-Host 的输出是看不到的
     $script:BtnMenu.Add_Click({
-        if ($script:Busy) { return }
-        if (Test-MenuInstalled) {
-            if ([System.Windows.Forms.MessageBox]::Show('右键菜单已存在，是否移除？', '右键菜单', 'YesNo', 'Question') -eq 'Yes') {
-                Uninstall-Menu | Out-Null
-                Write-Log '🗑️ 右键菜单已移除'
-                [System.Windows.Forms.MessageBox]::Show('右键菜单已移除。', '右键菜单', 'OK', 'Information') | Out-Null
+        Invoke-Guarded {
+            if (Test-MenuInstalled) {
+                $r = Show-Msg -Title '右键菜单' -Kind 4 -Text '右键菜单已经安装过了，要移除吗？' -Buttons '移除','取消' -Kinds 2,0 -Default 1 -Cancel 1
+                if ($r -eq 0) {
+                    Uninstall-Menu | Out-Null
+                    Write-Log '🗑️ 右键菜单已移除'
+                    [void](Show-Msg -Title '右键菜单' -Kind 1 -Text '右键菜单已移除。')
+                }
+            } elseif (Install-Menu) {
+                Write-Log '✅ 右键菜单已安装'
+                [void](Show-Msg -Title '右键菜单' -Kind 1 -Text "已安装。`r`n`r`n重新打开一个文件夹窗口，在文件或文件夹上点右键，`r`n选「添加到强制删除列表」，它就会出现在这里。")
+            } else {
+                Write-Log '❌ 右键菜单安装失败：有注册表项写不进去'
+                $r = Show-Msg -Title '右键菜单' -Kind 3 -Text '安装失败：有注册表项写不进去。' -Buttons '知道了','打开日志' -Kinds 0,3 -Default 0 -Cancel 0
+                if ($r -eq 1) { Open-LogFile }
             }
-        } elseif (Install-Menu) {
-            Write-Log '✅ 右键菜单已安装'
-            [System.Windows.Forms.MessageBox]::Show("已安装。`r`n`r`n重新打开一个文件夹窗口，在文件或文件夹上点右键，`r`n选「添加到强制删除列表」，它就会出现在这里。", '右键菜单', 'OK', 'Information') | Out-Null
-        } else {
-            Write-Log '❌ 右键菜单安装失败：有注册表项写不进去'
-            [System.Windows.Forms.MessageBox]::Show('安装失败：有注册表项写不进去，请查看日志。', '右键菜单', 'OK', 'Warning') | Out-Null
         }
     })
 
     $script:BtnAdmin.Add_Click({
-        if ($script:Busy) { return }
-        try {
-            if ($script:HostExe) {
-                # 以管理员身份重启 exe；-ForceNew 让新实例等旧实例让出锁，避免抢不到单实例锁直接退出
-                Start-Process -FilePath $script:HostExe -Verb RunAs -ArgumentList '-ForceNew' | Out-Null
-                $script:Form.Close()
-            } else {
-                Start-Process -FilePath $script:PsExe -Verb RunAs -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -File "' + $PSCommandPath + '"')
-                $script:Form.Close()
+        Invoke-Guarded {
+            try {
+                if ($script:HostExe) {
+                    # 以管理员身份重启 exe；-ForceNew 让新实例等旧实例让出锁，避免抢不到单实例锁直接退出
+                    Start-Process -FilePath $script:HostExe -Verb RunAs -ArgumentList '-ForceNew' | Out-Null
+                    $script:Form.Close()
+                } else {
+                    Start-Process -FilePath $script:PsExe -Verb RunAs -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -File "' + $PSCommandPath + '"')
+                    $script:Form.Close()
+                }
+            } catch {
+                [void](Show-Msg -Title '以管理员身份重启' -Kind 2 -Text '提权被取消或没有成功，当前仍按原来的权限运行。')
             }
-        } catch {
-            [System.Windows.Forms.MessageBox]::Show('提权被取消或失败。', '提示', 'OK', 'Warning') | Out-Null
         }
     })
 
+    # 开始执行删除
     $script:BtnStart.Add_Click({
-        if ($script:Busy) { return }
-        $items = @(Get-QueueItems)
-        if ($items.Count -eq 0) {
-            [System.Windows.Forms.MessageBox]::Show('列表为空。', '提示', 'OK', 'Information') | Out-Null
-            return
-        }
-        $script:Opt.Unlock  = $script:CkUnlock.Checked
-        $script:Opt.FixAcl  = $script:CkAcl.Checked
-        $script:Opt.Confirm = $script:CkConfirm.Checked
-        if ($script:CkConfirm.Checked) {
-            $msg = '即将删除 ' + $items.Count + " 项，删除后不可恢复。`r`n`r`n过程中可能结束占用进程、修改文件权限。是否继续？"
-            if ([System.Windows.Forms.MessageBox]::Show($msg, '确认删除', 'YesNo', 'Warning') -ne 'Yes') { return }
-        }
-
-        $script:Busy = $true
-        $script:KillAll = $false
-        $script:RebootAll = $false
-        Set-UiEnabled $false
-        $script:Bar.Maximum = [Math]::Max(1, $items.Count)
-        $script:Bar.Value = 0
-        Write-Log ('══════ 开始批量处理，共 ' + $items.Count + ' 项 ══════')
-
-        $done = 0
-        $okCount = 0
-        $skipCount = 0
-        foreach ($it in $items) {
-            $done++
-            $script:Status.Text = '处理中 ' + $done + '/' + $items.Count + '：' + $it
-            Write-Log ('—————————— ' + $it + ' ——————————')
-            $ok = false
-            try { $ok = Invoke-ForceDelete -Path $it }
-            catch { Write-Log ('❌ 异常：' + $_.Exception.Message) }
-            if ($ok) {
-                $okCount++
-                $remain = @()
-                foreach ($q in @(Get-QueueItems)) {
-                    if (-not [string]::Equals($q, $it, [StringComparison]::OrdinalIgnoreCase)) { $remain += $q }
-                }
-                Set-QueueItems -Items $remain
-                Refresh-List
-            } else {
-                $skipCount++
+        Invoke-Guarded {
+            $items = @(Get-QueueItems)
+            if ($items.Count -eq 0) {
+                [void](Show-Msg -Title '列表为空' -Kind 0 -Text '先把要删除的文件或文件夹拖进列表。')
+                return
             }
-            $script:Bar.Value = [Math]::Min($done, $script:Bar.Maximum)
-            [System.Windows.Forms.Application]::DoEvents()
-        }
+            $script:Opt.Unlock  = $script:CkUnlock.Checked
+            $script:Opt.FixAcl  = $script:CkAcl.Checked
+            $script:Opt.Confirm = $script:CkConfirm.Checked
+            if ($script:CkConfirm.Checked) {
+                $msg = '即将删除 ' + $items.Count + " 项，删除后无法恢复。" + "`r`n`r`n" +
+                       '过程中可能会结束占用文件的进程、修改文件权限。' + "`r`n" +
+                       '删不掉的项会留在列表里，不会丢。'
+                $r = Show-Msg -Title '确认删除' -Kind 4 -Text $msg -Buttons '删除','取消' -Kinds 1,0 -Default 1 -Cancel 1
+                if ($r -ne 0) { Write-Log '⏹️ 已取消，没有删除任何东西'; return }
+            }
 
-        $script:Busy = $false
-        Set-UiEnabled $true
-        Refresh-List
-        $fail = $items.Count - $okCount
-        $script:Status.Text = '完成：成功 ' + $okCount + ' 项，失败 ' + $fail + ' 项'
-        Write-Log ('══════ 处理完毕：成功 ' + $okCount + '，失败 ' + $fail + ' ══════')
-        if ($fail -gt 0) {
-            [System.Windows.Forms.MessageBox]::Show(('有 ' + $fail + ' 项未能删除，详见日志。'), '完成', 'OK', 'Warning') | Out-Null
+            $script:Busy = $true
+            $script:KillAll = $false
+            $script:RebootAll = $false
+            Set-UiEnabled $false
+            $script:Bar.Maximum = [Math]::Max(1, $items.Count)
+            $script:Bar.Value = 0
+            Write-Log ('══════ 开始批量处理，共 ' + $items.Count + ' 项 ══════')
+
+            $res = Invoke-QueueDelete -Items $items `
+                -OnProgress {
+                    param($i, $total, $it)
+                    try {
+                        $script:Status.Text = '处理中 ' + $i + '/' + $total + '：' + $it
+                        $script:Bar.Value = [Math]::Min($i - 1, $script:Bar.Maximum)
+                        [System.Windows.Forms.Application]::DoEvents()
+                    } catch { }
+                } `
+                -OnItemDone {
+                    param($it, $ok, $i)
+                    try {
+                        if ($ok) {
+                            # 删成功的项从队列文件里去掉，列表随之刷新
+                            $remain = @()
+                            foreach ($q in @(Get-QueueItems)) {
+                                if (-not [string]::Equals($q, $it, [StringComparison]::OrdinalIgnoreCase)) { $remain += $q }
+                            }
+                            Set-QueueItems -Items $remain
+                            Refresh-List
+                        }
+                        $script:Bar.Value = [Math]::Min($i, $script:Bar.Maximum)
+                        [System.Windows.Forms.Application]::DoEvents()
+                    } catch { }
+                }
+
+            Refresh-List
+            $fail = @($res.Failed).Count
+            $okCount = $items.Count - $fail
+            $script:Status.Text = '完成：成功 ' + $okCount + ' 项，失败 ' + $fail + ' 项'
+            Write-Log ('══════ 处理完毕：成功 ' + $okCount + '，失败 ' + $fail + ' ══════')
+
+            # 先恢复界面再弹结果提示：提示框关掉之后按钮必须是可点的
+            $script:Busy = $false
+            Set-UiEnabled $true
+
+            if ($fail -gt 0) {
+                $tip = '有 ' + $fail + ' 项没能删掉，它们还留在列表里。' + "`r`n`r`n" +
+                       '可以点「打开日志」看每一步卡在哪里；' + "`r`n" +
+                       '不打算再删的，选中后按 Delete 或点「移除选中」把它移出列表。'
+                $r = Show-Msg -Title '处理完毕' -Kind 2 -Text $tip -Buttons '知道了','打开日志' -Kinds 0,3 -Default 0 -Cancel 0
+                if ($r -eq 1) { Open-LogFile }
+            } elseif ($items.Count -eq 1) {
+                [void](Show-Msg -Title '处理完毕' -Kind 1 -Text ('已删除：' + $items[0]))
+            } else {
+                [void](Show-Msg -Title '处理完毕' -Kind 1 -Text ('已删除 ' + $okCount + ' 项，列表已清空。'))
+            }
         }
     })
 
     $script:Form.Add_FormClosing({
         param($s, $e)
         if ($script:Busy) {
-            if ([System.Windows.Forms.MessageBox]::Show('正在处理中，确定退出？', '提示', 'YesNo', 'Warning') -ne 'Yes') {
-                $e.Cancel = $true
-            }
+            $r = Show-Msg -Title '正在处理' -Kind 2 -Text ('正在处理中，现在退出的话，' + "`r`n" + '剩下的项不会再处理（已经删掉的无法恢复）。') -Buttons '继续等待','仍然退出' -Kinds 1,2 -Default 0 -Cancel 0
+            if ($r -ne 1) { $e.Cancel = $true }
         }
     })
 
@@ -1652,6 +1829,64 @@ function Invoke-SelfTest {
     Set-QueueItems -Items @('C:\a.txt', 'C:\b c.txt')
     Check '队列-写入读取' ((@(Get-QueueItems).Count) -eq 2)
     Set-QueueItems -Items $bak
+
+    # 8b 脚本自查：PowerShell 里 true / false / null 不是布尔字面量，写成命令一执行就抛异常。
+    #     v1.0.0、v1.1.0 的「开始执行删除」就是栽在一句 `$ok = false` 上，而当时的自检测不到。
+    $badLits = -1
+    try {
+        $tk = $null; $er = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($PSCommandPath, [ref]$tk, [ref]$er)
+        $badLits = 0
+        foreach ($c in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)) {
+            $cn = $c.GetCommandName()
+            if ($cn -eq 'true' -or $cn -eq 'false' -or $cn -eq 'null') {
+                $badLits++
+                Write-Host ('        第 ' + $c.Extent.StartLineNumber + ' 行：' + $c.Extent.Text) -ForegroundColor Yellow
+            }
+        }
+    } catch { }
+    Check '脚本-没有把 true/false/null 当命令执行' ($badLits -eq 0)
+
+    # 8c 引擎的返回值必须恰好是一个布尔值。内部命令若多吐了输出，调用方会把数组当成「成功」，把没删掉的项移出列表
+    $f5 = Join-Path $repo 'single.txt'
+    Set-Content -LiteralPath $f5 -Value 'x'
+    $rOut = @(Invoke-ForceDelete -Path $f5)
+    Check '引擎-成功时只返回一个 True' (($rOut.Count -eq 1) -and ($rOut[0] -is [bool]) -and $rOut[0])
+    $f6 = Join-Path $repo 'held.txt'
+    Set-Content -LiteralPath $f6 -Value 'x'
+    $fs6 = [System.IO.File]::Open($f6, 'Open', 'ReadWrite', 'None')
+    $rOut2 = @(Invoke-ForceDelete -Path $f6)
+    $fs6.Close(); $fs6.Dispose()
+    Check '引擎-失败时只返回一个 False' (($rOut2.Count -eq 1) -and ($rOut2[0] -is [bool]) -and (-not $rOut2[0]) -and (Test-Exists -Path $f6))
+
+    # 8d 批量删除：界面「开始执行删除」调用的就是这一个函数
+    $bd = Join-Path $repo 'batch'
+    New-Item -ItemType Directory -Path $bd -Force | Out-Null
+    $b1 = Join-Path $bd 'a.txt'
+    $b2 = Join-Path $bd 'b.txt'
+    Set-Content -LiteralPath $b1 -Value 'x'
+    Set-Content -LiteralPath $b2 -Value 'x'
+    $bGone = Join-Path $bd 'gone.txt'
+    $script:st_prog = 0
+    $script:st_done = @()
+    $res = Invoke-QueueDelete -Items @($b1, $bGone, $b2) `
+        -OnProgress {
+            param($i, $t, $it)
+            $script:st_prog = $i
+        } `
+        -OnItemDone {
+            param($it, $ok, $i)
+            $script:st_done += ($it + '=' + $ok)
+        }
+    Check '批量-逐项删除并统计成功数' ((@($res.Ok).Count -eq 3) -and (@($res.Failed).Count -eq 0) -and (-not (Test-Exists -Path $b1)) -and (-not (Test-Exists -Path $b2)))
+    Check '批量-进度与完成回调都被调用' (($script:st_prog -eq 3) -and (@($script:st_done).Count -eq 3))
+    Check '批量-不存在的目标算作已完成' (@($res.Ok) -contains $bGone)
+    $bf = Join-Path $bd 'held.txt'
+    Set-Content -LiteralPath $bf -Value 'x'
+    $fsb = [System.IO.File]::Open($bf, 'Open', 'ReadWrite', 'None')
+    $res2 = Invoke-QueueDelete -Items @($bf)
+    $fsb.Close(); $fsb.Dispose()
+    Check '批量-删不掉的计入失败且文件还在' ((@($res2.Ok).Count -eq 0) -and (@($res2.Failed).Count -eq 1) -and (Test-Exists -Path $bf))
 
     Remove-Item -LiteralPath $repo -Recurse -Force -ErrorAction SilentlyContinue
 
