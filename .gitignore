@@ -1,0 +1,12 @@
+# 构建产物
+dist/
+*.exe
+
+# 运行时文件
+*.log
+queue.txt
+
+# IDE / 系统
+.vs/
+*.user
+Thumbs.db
