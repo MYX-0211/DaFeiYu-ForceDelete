@@ -6,7 +6,7 @@
 
 ## 下载与运行
 
-到 [Releases](../../releases) 下载 `大肥鱼-强制删除工具.exe`，双击即可运行，不需要安装。
+到 [Releases](../../releases) 下载 `DaFeiYu-ForceDelete-v1.0.0.exe`，双击即可运行，不需要安装。文件名可以随意改，不影响功能。
 
 - 系统要求：Windows 10 / 11，自带 .NET Framework 4.x 与 PowerShell 5.1，无需额外安装
 - 单文件约 1.4 MB，脚本、界面、图标、背景图全部内嵌
@@ -49,6 +49,8 @@
 大肥鱼-强制删除工具.exe -Pending "路径"  登记为下次开机时由系统删除
 大肥鱼-强制删除工具.exe -SelfTest        自检（19 项）
 ```
+
+（Release 里的文件名是 `DaFeiYu-ForceDelete-v1.0.0.exe`，下面以自己构建出的文件名举例。）
 
 也可以不编译直接跑脚本：`powershell -ExecutionPolicy Bypass -File src\DeepSeek.ps1`。脚本需要和 `DeepSeek.Ui.cs`、`logo.ico`、`bg.png` 放在同一目录。
 
